@@ -13,59 +13,123 @@ CONF_FILE="$HOME/.msgme.conf"
 VERBOSITY=${VERBOSITY:-2}
 AI_HOST=${AI_HOST:-"localhost:11434"}
 AI_MODEL=${AI_MODEL:-""}
+
+# Store config values for defaults (supports space-separated lists)
+CONF_PHONES=(${=PHONE})
+CONF_EMAILS=(${=EMAIL})
+
+# Active delivery lists (built by arg parser)
+PHONES=()
+EMAILS=()
 USE_SPEECH=false
+HAS_PHONE_FLAG=false
+HAS_EMAIL_FLAG=false
+HAS_SPEECH_FLAG=false
 
 show_help() {
     cat << EOF
 Usage: msgme [options] -- command [args]
 
+Channels (additive — use multiple to combine):
+  -n  <numbers...>     Add iMessage recipients (space-separated)
+  -nr <numbers...>     Replace config phone list with these
+  --email  <addrs...>  Add email recipients (space-separated)
+  --emailr <addrs...>  Replace config email list with these
+  -er <addrs...>       Same as --emailr
+  -s [text]            Enable speech (optional custom text)
+
 Options:
-  -n <number>        iMessage phone number (e.g., +17605551234)
-  --email <addr>     Email notification address
-  --msg <text>       Static text message
-  -s [text]          Enable speech (optional custom text)
+  --msg <text>       Static text message (skip AI)
   -v <1-3>           Verbosity (1: Brief, 2: Normal, 3: Chatty)
   --ai [host:port] <model> AI config (default host: localhost:11434)
   --aip <prompt>     Additional AI instructions
   -d                 Debug mode (foreground, shows JSON traffic)
   -h                 Show this help
 
-Example:
-  msgme -n +17605551234 -v 3 --ai "localhost:11434 gemma3:27b" -s -- ./build.sh
-  msgme --email user@example.com -- ./build.sh
+Defaults: Set DEFAULT="IMESSAGE EMAIL SPEECH" in ~/.msgme.conf
+          If no channel flags given, DEFAULT determines what fires.
+
+Examples:
+  msgme -- ./build.sh                          # uses DEFAULT channels
+  msgme -n -- ./build.sh                       # add iMessage (config number)
+  msgme -n +1555 +1666 --email a@b.com -- cmd  # multiple recipients
+  msgme -nr +1999 -- cmd                       # replace config phone list
 EOF
+}
+
+# Helper: consume space-separated values until next flag or --
+_consume_values() {
+    local -a vals=()
+    while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+        vals+=("$1"); shift
+    done
+    # Return values via global
+    _CONSUMED=("${vals[@]}")
+    _REMAINING=$#
 }
 
 # 3. Robust Argument Parser
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { PHONE="$2"; shift 2; } || { echo "Error: -n requires a phone number"; exit 1; } ;;
-        --email) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { EMAIL="$2"; shift 2; } || { echo "Error: --email requires an address"; exit 1; } ;;
-        --msg) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
-        -s)    USE_SPEECH=true; [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_SPEECH="$2"; shift 2; } || shift 1 ;;
+        -n)
+            HAS_PHONE_FLAG=true; shift
+            # Additive: include config phones
+            [[ "$DEFAULT" == *IMESSAGE* ]] && PHONES+=("${CONF_PHONES[@]}")
+            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+                PHONES+=("$1"); shift
+            done
+            # -n with no extra values = just config phones
+            ;;
+        -nr)
+            HAS_PHONE_FLAG=true; PHONES=(); shift
+            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+                PHONES+=("$1"); shift
+            done
+            ;;
+        --email|-e)
+            HAS_EMAIL_FLAG=true; shift
+            # Additive: include config emails
+            [[ "$DEFAULT" == *EMAIL* ]] && EMAILS+=("${CONF_EMAILS[@]}")
+            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+                EMAILS+=("$1"); shift
+            done
+            ;;
+        --emailr|-er)
+            HAS_EMAIL_FLAG=true; EMAILS=(); shift
+            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+                EMAILS+=("$1"); shift
+            done
+            ;;
+        -s)    HAS_SPEECH_FLAG=true; USE_SPEECH=true; shift
+               [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]] && { STATIC_SPEECH="$1"; shift; } ;;
+        --msg) [[ -n "$1" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
         -v)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
         --ai)
-            if [[ "$2" == *" "* ]]; then
-                # "host:port model" in one quoted arg
-                AI_HOST="${2%% *}"; AI_MODEL="${2#* }"; shift 2
-            elif [[ "$2" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then
-                # host:port as separate arg, model follows
-                AI_HOST="$2"; AI_MODEL="$3"; shift 3
-            elif [[ "$2" == ":"* ]]; then
-                # :port shorthand
-                AI_HOST="localhost${2}"; AI_MODEL="$3"; shift 3
+            shift
+            if [[ "$1" == *" "* ]]; then
+                AI_HOST="${1%% *}"; AI_MODEL="${1#* }"; shift
+            elif [[ "$1" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then
+                AI_HOST="$1"; AI_MODEL="$2"; shift 2
+            elif [[ "$1" == ":"* ]]; then
+                AI_HOST="localhost${1}"; AI_MODEL="$2"; shift 2
             else
-                # Just a model name (e.g., gemma3:27b, claude-haiku-4-5)
-                AI_MODEL="$2"; shift 2
+                AI_MODEL="$1"; shift
             fi
             ;;
         --aip) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { AI_EXTRA_PROMPT="$2"; shift 2; } || shift 1 ;;
         -d)    DEBUG=1; shift ;;
         -h)    show_help; exit 0 ;;
         --)    shift; break ;;
-        *)     shift ;; 
+        *)     shift ;;
     esac
 done
+
+# Apply DEFAULT from config per-channel (only for channels without explicit flags)
+if [[ -n "$DEFAULT" ]]; then
+    [[ "$HAS_PHONE_FLAG" != true && "$DEFAULT" == *IMESSAGE* ]] && PHONES+=("${CONF_PHONES[@]}")
+    [[ "$HAS_EMAIL_FLAG" != true && "$DEFAULT" == *EMAIL* ]] && EMAILS+=("${CONF_EMAILS[@]}")
+    [[ "$HAS_SPEECH_FLAG" != true && "$DEFAULT" == *SPEECH* ]] && USE_SPEECH=true
+fi
 
 APP_CMD=("$@")
 [[ ${#APP_CMD} -eq 0 ]] && { show_help; exit 0; }
@@ -226,9 +290,10 @@ print(json.dumps({'sms': str(sms), 'speech': str(speech)}))
     # Fallbacks - Only trigger if the variables are completely empty
     final_msg="${final_msg:-${STATIC_MSG:-"App done (Code $EXIT_CODE)"}}"
 
-    # 6. Deliver iMessage (Argument Method - completely avoids quote crashing)
-    if [[ -n "$PHONE" ]]; then
-        [[ -n "$DEBUG" ]] && echo "Sending iMessage to $PHONE: $final_msg"
+    # 6. Deliver iMessage to all recipients
+    for phone in "${PHONES[@]}"; do
+        [[ -z "$phone" ]] && continue
+        [[ -n "$DEBUG" ]] && echo "Sending iMessage to $phone: $final_msg"
         local imsg_err
         imsg_err=$(osascript -e 'on run argv' \
                   -e 'tell application "Messages"' \
@@ -236,21 +301,21 @@ print(json.dumps({'sms': str(sms), 'speech': str(speech)}))
                   -e 'set targetBuddy to participant (item 2 of argv) of targetService' \
                   -e 'send (item 1 of argv) to targetBuddy' \
                   -e 'end tell' \
-                  -e 'end run' -- "$final_msg" "$PHONE" 2>&1)
+                  -e 'end run' -- "$final_msg" "$phone" 2>&1)
         if [[ -n "$DEBUG" && -n "$imsg_err" ]]; then
             echo "--- DEBUG: iMessage result ---\n$imsg_err"
         fi
-    fi
+    done
 
-    # 7. Deliver Email
-    if [[ -n "$EMAIL" ]]; then
-        [[ -n "$DEBUG" ]] && echo "Sending email to $EMAIL: $final_msg"
-        local email_from="${EMAIL_FROM:-"msgme@localhost"}"
-        local email_from_name="${EMAIL_FROM_NAME:-"msgme"}"
+    # 7. Deliver Email to all recipients
+    local email_from="${EMAIL_FROM:-"msgme@localhost"}"
+    local email_from_name="${EMAIL_FROM_NAME:-"msgme"}"
+    for email_addr in "${EMAILS[@]}"; do
+        [[ -z "$email_addr" ]] && continue
+        [[ -n "$DEBUG" ]] && echo "Sending email to $email_addr: $final_msg"
         local email_response
 
         if [[ -n "$BREVO_SMTP_API_KEY" ]]; then
-            # Brevo REST API
             [[ -n "$DEBUG" ]] && echo "--- DEBUG: Email method: Brevo REST API ---"
             email_response=$(curl -4 -s --max-time 15 -X POST 'https://api.brevo.com/v3/smtp/email' \
                 -H "api-key: $BREVO_SMTP_API_KEY" \
@@ -262,9 +327,8 @@ print(json.dumps({
     "to": [{"email": sys.argv[3]}],
     "subject": "msgme notification",
     "textContent": sys.argv[4]
-}))' "$email_from_name" "$email_from" "$EMAIL" "$final_msg")" 2>&1)
+}))' "$email_from_name" "$email_from" "$email_addr" "$final_msg")" 2>&1)
         else
-            # Generic SMTP (works with Gmail, Outlook, Brevo SMTP, any provider)
             local smtp_host="${SMTP_HOST:-smtp.gmail.com}"
             local smtp_port="${SMTP_PORT:-587}"
             local smtp_user="${SMTP_USER:-$BREVO_SMTP_USERNAME}"
@@ -283,12 +347,12 @@ smtp.login(sys.argv[7], sys.argv[8])
 smtp.send_message(msg)
 smtp.quit()
 print('Sent!')
-" "$email_from_name" "$email_from" "$EMAIL" "$final_msg" "$smtp_host" "$smtp_port" "$smtp_user" "$smtp_pass" 2>&1)
+" "$email_from_name" "$email_from" "$email_addr" "$final_msg" "$smtp_host" "$smtp_port" "$smtp_user" "$smtp_pass" 2>&1)
         fi
         if [[ -n "$DEBUG" ]]; then
             echo "--- DEBUG: Email result ---\n$email_response"
         fi
-    fi
+    done
 
     # 8. Deliver Speech
     if [[ "$USE_SPEECH" == true ]]; then
