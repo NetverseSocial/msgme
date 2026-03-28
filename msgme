@@ -46,13 +46,19 @@ while [[ $# -gt 0 ]]; do
         -v)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
         --ai)
             if [[ "$2" == *" "* ]]; then
+                # "host:port model" in one quoted arg
                 AI_HOST="${2%% *}"; AI_MODEL="${2#* }"; shift 2
-            elif [[ "$2" == *:* || "$2" == "."* ]]; then
+            elif [[ "$2" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then
+                # host:port as separate arg, model follows
                 AI_HOST="$2"; AI_MODEL="$3"; shift 3
+            elif [[ "$2" == ":"* ]]; then
+                # :port shorthand
+                AI_HOST="localhost${2}"; AI_MODEL="$3"; shift 3
             else
+                # Just a model name (e.g., gemma3:27b, claude-haiku-4-5)
                 AI_MODEL="$2"; shift 2
             fi
-            [[ "$AI_HOST" == :* ]] && AI_HOST="localhost$AI_HOST" ;;
+            ;;
         --aip) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { AI_EXTRA_PROMPT="$2"; shift 2; } || shift 1 ;;
         -d)    DEBUG=1; shift ;;
         -h)    show_help; exit 0 ;;
@@ -80,62 +86,141 @@ notify() {
     if [[ -n $AI_MODEL ]]; then
         local sys_text="You are a CLI notification assistant. Analyze the output. Return ONLY a JSON object with 'sms' (string) and 'speech' (string) keys. Verbosity: $VERBOSITY. 'sms' should be a concise summary. 'speech' must be a natural sentence. Context: $AI_EXTRA_PROMPT"
         local user_text="Exit Code: $EXIT_CODE\nOutput: $output_content"
+        local full_prompt="$sys_text\n\n$user_text"
 
-        local payload=$(python3 -c '
+        # Detect AI provider from model name
+        local ai_provider="ollama"
+        case "$AI_MODEL" in
+            claude|claude-*) ai_provider="claude" ;;
+            gemini|gemini-*) ai_provider="gemini" ;;
+            gpt-*|o1-*|o3-*|o4-*|o5-*) ai_provider="codex" ;;
+        esac
+        [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI Provider: $ai_provider | Model: $AI_MODEL ---"
+
+        local response
+        local ai_cmd_file=$(mktemp /tmp/msgme_ai.XXXXXX)
+
+        case "$ai_provider" in
+            claude)
+                local claude_cmd="echo $(printf '%q' "$full_prompt") | claude -p 'Return ONLY a JSON object with sms and speech keys. sms: concise summary. speech: natural sentence.' --model $AI_MODEL --output-format json 2>&1"
+                [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---\nProvider: claude CLI\nModel: $AI_MODEL"
+                if [[ -n $DEBUG ]]; then
+                    printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
+                    echo "$full_prompt" | claude -p "$sys_text" --model "$AI_MODEL" --output-format json > "$ai_cmd_file" 2>&1 &
+                    local ai_pid=$!
+                    while kill -0 $ai_pid 2>/dev/null; do printf "."; sleep 1; done
+                    response=$(<"$ai_cmd_file")
+                    echo " done!"
+                else
+                    response=$(echo "$full_prompt" | claude -p "$sys_text" --model "$AI_MODEL" --output-format json 2>&1)
+                fi
+                ;;
+            gemini)
+                [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---\nProvider: gemini CLI\nModel: $AI_MODEL"
+                if [[ -n $DEBUG ]]; then
+                    printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
+                    gemini -p "$sys_text $user_text" -o json > "$ai_cmd_file" 2>/dev/null &
+                    local ai_pid=$!
+                    while kill -0 $ai_pid 2>/dev/null; do printf "."; sleep 1; done
+                    response=$(<"$ai_cmd_file")
+                    echo " done!"
+                else
+                    response=$(gemini -p "$sys_text $user_text" -o json 2>/dev/null)
+                fi
+                ;;
+            codex)
+                [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---\nProvider: codex CLI\nModel: $AI_MODEL"
+                if [[ -n $DEBUG ]]; then
+                    printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
+                    codex exec -m "$AI_MODEL" --skip-git-repo-check --ephemeral "$sys_text $user_text" > "$ai_cmd_file" 2>&1 &
+                    local ai_pid=$!
+                    while kill -0 $ai_pid 2>/dev/null; do printf "."; sleep 1; done
+                    response=$(<"$ai_cmd_file")
+                    echo " done!"
+                else
+                    response=$(codex exec -m "$AI_MODEL" --skip-git-repo-check --ephemeral "$sys_text $user_text" 2>&1)
+                fi
+                ;;
+            ollama)
+                local payload=$(python3 -c '
 import json, sys
 data = {"model": sys.argv[3], "messages": [{"role": "system", "content": sys.argv[1]}, {"role": "user", "content": sys.argv[2]}], "stream": False, "format": "json"}
 print(json.dumps(data))' "$sys_text" "$user_text" "$AI_MODEL")
-
-        [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---" && echo "$payload" | python3 -m json.tool
-
-        local response
+                [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---" && echo "$payload" | python3 -m json.tool
+                if [[ -n $DEBUG ]]; then
+                    printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
+                    curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload" > "$ai_cmd_file" &
+                    local ai_pid=$!
+                    while kill -0 $ai_pid 2>/dev/null; do printf "."; sleep 1; done
+                    response=$(<"$ai_cmd_file")
+                    echo " done!"
+                else
+                    response=$(curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload")
+                fi
+                ;;
+        esac
+        rm -f "$ai_cmd_file"
         if [[ -n $DEBUG ]]; then
-            printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
-            local curl_pid_file=$(mktemp /tmp/msgme_curl.XXXXXX)
-            curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload" > "$curl_pid_file" &
-            local curl_pid=$!
-            while kill -0 $curl_pid 2>/dev/null; do
-                printf "."
-                sleep 1
-            done
-            response=$(<"$curl_pid_file")
-            rm -f "$curl_pid_file"
-            echo " done!"
-        else
-            response=$(curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload")
+            echo "\n--- DEBUG: AI RESPONSE ---"
+            printf '%s\n' "$response" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$response"
         fi
-        [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI RESPONSE ---" && echo "$response" | python3 -m json.tool
 
-        # Robust Multi-Layer JSON Extraction (Now strips Markdown!)
-        local results=$(echo "$response" | python3 -c "
-import sys, json
-def parse_ai_msg(raw_input):
+        # Universal JSON extraction — handles all provider response formats
+        local results=$(printf '%s' "$response" | python3 -c "
+import sys, json, re
+
+def extract_json_obj(text):
+    '''Find first JSON object with sms/speech keys in any text'''
+    # Strip markdown code fences
+    text = re.sub(r'\`\`\`json?\s*', '', text)
+    text = re.sub(r'\`\`\`', '', text)
+    text = text.strip()
     try:
-        data = json.loads(raw_input)
-        content = data.get('message', {}).get('content', '').strip()
-        
-        # Strip markdown formatting if the model added it
-        if content.startswith('\`\`\`'):
-            lines = content.split('\n')
-            if lines[0].startswith('\`\`\`'): lines = lines[1:]
-            if len(lines) > 0 and lines[-1].startswith('\`\`\`'): lines = lines[:-1]
-            content = '\n'.join(lines).strip()
+        obj = json.loads(text)
+        if isinstance(obj, dict) and ('sms' in obj or 'speech' in obj):
+            return obj
+    except: pass
+    # Try to find embedded JSON
+    for match in re.finditer(r'\{[^{}]*\}', text):
+        try:
+            obj = json.loads(match.group())
+            if 'sms' in obj or 'speech' in obj:
+                return obj
+        except: pass
+    return {}
 
-        if isinstance(content, str):
-            try: content = json.loads(content)
-            except: pass
-            
-        sms = content.get('sms', '') if isinstance(content, dict) else ''
-        if isinstance(sms, list):
-            sms = '\n'.join([f\"{i.get('field','')}: {i.get('value','')}\" if isinstance(i,dict) else str(i) for i in sms])
-        speech = content.get('speech', '') if isinstance(content, dict) else ''
-        return {'sms': str(sms), 'speech': str(speech)}
-    except Exception as e:
-        return {'sms': '', 'speech': ''}
-print(json.dumps(parse_ai_msg(sys.stdin.read())))
+raw = sys.stdin.read().strip()
+try:
+    data = json.loads(raw)
+    # Claude CLI format
+    if 'result' in data:
+        content = data['result']
+    # Gemini CLI format
+    elif 'response' in data:
+        content = data['response']
+    # Ollama format
+    elif 'message' in data and 'content' in data.get('message', {}):
+        content = data['message']['content']
+    # OpenAI format
+    elif 'choices' in data:
+        content = data['choices'][0]['message']['content']
+    # Gemini format
+    elif 'candidates' in data:
+        content = data['candidates'][0]['content']['parts'][0]['text']
+    else:
+        content = raw
+except:
+    content = raw
+
+result = extract_json_obj(str(content))
+sms = result.get('sms', '')
+speech = result.get('speech', '')
+if isinstance(sms, list):
+    sms = ', '.join([str(i) for i in sms])
+print(json.dumps({'sms': str(sms), 'speech': str(speech)}))
 ")
-        final_msg=$(echo "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('sms', ''))")
-        final_speech=$(echo "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('speech', ''))")
+        final_msg=$(printf '%s' "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('sms', ''))")
+        final_speech=$(printf '%s' "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('speech', ''))")
     fi
 
     # Fallbacks - Only trigger if the variables are completely empty
