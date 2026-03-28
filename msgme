@@ -21,6 +21,7 @@ Usage: msgme [options] -- command [args]
 
 Options:
   -n <number>        iMessage phone number (e.g., +17605551234)
+  --email <addr>     Email notification address
   --msg <text>       Static text message
   -s [text]          Enable speech (optional custom text)
   -v <1-3>           Verbosity (1: Brief, 2: Normal, 3: Chatty)
@@ -31,6 +32,7 @@ Options:
 
 Example:
   msgme -n +17605551234 -v 3 --ai "localhost:11434 gemma3:27b" -s -- ./build.sh
+  msgme --email user@example.com -- ./build.sh
 EOF
 }
 
@@ -38,6 +40,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { PHONE="$2"; shift 2; } || { echo "Error: -n requires a phone number"; exit 1; } ;;
+        --email) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { EMAIL="$2"; shift 2; } || { echo "Error: --email requires an address"; exit 1; } ;;
         --msg) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
         -s)    USE_SPEECH=true; [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_SPEECH="$2"; shift 2; } || shift 1 ;;
         -v)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
@@ -154,7 +157,29 @@ print(json.dumps(parse_ai_msg(sys.stdin.read())))
         fi
     fi
 
-    # 7. Deliver Speech
+    # 7. Deliver Email (via Brevo API)
+    if [[ -n "$EMAIL" ]]; then
+        [[ -n "$DEBUG" ]] && echo "Sending email to $EMAIL: $final_msg"
+        local email_from="${EMAIL_FROM:-"msgme@Netverse.net"}"
+        local email_from_name="${EMAIL_FROM_NAME:-"msgme"}"
+        local email_response
+        email_response=$(curl -4 -s --max-time 15 -X POST 'https://api.brevo.com/v3/smtp/email' \
+            -H "api-key: $BREVO_SMTP_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d "$(python3 -c '
+import json, sys
+print(json.dumps({
+    "sender": {"name": sys.argv[1], "email": sys.argv[2]},
+    "to": [{"email": sys.argv[3]}],
+    "subject": "msgme notification",
+    "textContent": sys.argv[4]
+}))' "$email_from_name" "$email_from" "$EMAIL" "$final_msg")" 2>&1)
+        if [[ -n "$DEBUG" ]]; then
+            echo "--- DEBUG: Email result ---\n$email_response"
+        fi
+    fi
+
+    # 8. Deliver Speech
     if [[ "$USE_SPEECH" == true ]]; then
         final_speech="${final_speech:-${STATIC_SPEECH:-"Application completed"}}"
         [[ -n "$DEBUG" ]] && echo "Speaking: $final_speech"
