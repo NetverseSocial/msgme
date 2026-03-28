@@ -38,11 +38,11 @@ chmod +x /usr/local/bin/msgme
 
 ## AI Providers
 
-The `--ai` flag auto-detects the provider from the model name:
+The `--ai` (or `-a`) flag auto-detects the provider from the model name. If omitted, the `AI_MODEL` from your config is used.
 
 | Provider | Example | Requires | Install |
 |----------|---------|----------|---------|
-| **Ollama** | `--ai gemma3:27b` | [Ollama](https://ollama.com) running locally | `brew install ollama` |
+| **Ollama** | `--ai gemma3:1b` | [Ollama](https://ollama.com) running locally | `brew install ollama` |
 | **Claude** | `--ai claude-haiku-4-5` | [Claude Code](https://claude.ai/code) CLI, logged in | `npm i -g @anthropic-ai/claude-code` |
 | **Codex** | `--ai gpt-5.1-codex-mini` | [Codex CLI](https://github.com/openai/codex), logged in | `npm i -g @openai/codex` |
 | **Gemini** | `--ai gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli), logged in | `npm i -g @google/gemini-cli` |
@@ -62,6 +62,7 @@ EMAIL="user@example.com ops@example.com"
 
 AI_HOST="localhost:11434"
 AI_MODEL="gemma3:1b"
+AIP="keep it brief and professional"
 VERBOSITY=3
 
 # Which channels fire when no flags are given
@@ -97,16 +98,19 @@ Channels are selected per invocation. If no channel flags are given, `DEFAULT` f
 
 | Flag | Action | Example |
 |------|--------|---------|
-| `-n` | **Add** iMessage recipients | `-n +1555 +1666` |
-| `-nr` | **Replace** config phones | `-nr +1999` |
-| `--email` / `-e` | **Add** email recipients | `--email a@b.com c@d.com` |
-| `--emailr` / `-er` | **Replace** config emails | `-er solo@b.com` |
+| `-n` | **Add** iMessage recipients | `-n +15551234567 +15559876543` |
+| `-nr` | **Replace** config phones | `-nr +15559999999` |
+| `-e` | **Add** email recipients | `-e a@b.com c@d.com` |
+| `-er` | **Replace** config emails | `-er solo@b.com` |
 | `-s` | **Enable** speech | `-s "custom text"` |
+| `-aip` | **Add** to default AI instructions | `-aip "respond in Spanish"` |
+| `-aipr` | **Replace** default AI instructions | `-aipr "one word only"` |
 
-- **Add** flags append to config values (e.g., `-n +1555` sends to config phones AND +1555)
+- **Add** flags append to config values (e.g., `-n +15559999999` sends to config phones AND +15559999999)
 - **Replace** flags discard config values and use only what's on the command line
 - Flags accept multiple space-separated values — everything until the next `-` flag or `--`
 - Each channel is independent — using `-n` doesn't affect email or speech defaults
+- All flags accept any length: `-e`, `-em`, `-email` all work the same
 - iMessage requires Apple devices; for Android/Google Voice users, use email instead
 
 ## Usage
@@ -115,51 +119,57 @@ Channels are selected per invocation. If no channel flags are given, `DEFAULT` f
 Usage: msgme [options] -- command [args]
 
 Channels:
-  -n  <numbers...>       Add iMessage recipients (space-separated)
-  -nr <numbers...>       Replace config phone list with these
-  --email  <addrs...>    Add email recipients (space-separated)
-  --emailr <addrs...>    Replace config email list with these
-  -e  / -er              Short forms of --email / --emailr
-  -s [text]              Enable speech (optional custom text)
+  -n  <numbers...>    Add iMessage recipients
+  -nr <numbers...>    Replace config phone list
+  -e  <addrs...>      Add email recipients
+  -er <addrs...>      Replace config email list
+  -s  [text]          Enable speech (optional custom text)
+
+AI:
+  -a  <model>         AI provider/model (auto-detected from name)
+  -aip <prompt>       Add to config AI instructions (AIP in .conf)
+  -aipr <prompt>      Replace config AI instructions for this run
 
 Options:
-  --msg <text>           Static text message (skip AI)
-  -v <1-3>               Verbosity (1: Brief, 2: Normal, 3: Chatty)
-  --ai <model>           AI provider/model (auto-detected from name)
-  --aip <prompt>         Additional AI instructions
-  -d                     Debug mode (foreground, shows JSON traffic)
-  -h                     Show this help
+  -m <text>           Static text message (skip AI)
+  -v <1-3>            Verbosity (1: Brief, 2: Normal, 3: Chatty)
+  -d                  Debug mode (foreground, shows JSON traffic)
+  -h                  Show this help
+
+All flags accept any length: -e, -em, -email all work.
 ```
 
 ## Examples
 
 ```bash
-# Uses DEFAULT channels from config
+# Uses DEFAULT channels + AI_MODEL + AIP from config
 msgme -- make build
 
-# AI providers
-msgme --ai gemma3:1b -- make build           # Ollama (local, fast, tiny)
-msgme --ai claude-haiku-4-5 -- make build    # Claude (Sub Max)
-msgme --ai gpt-5.1-codex-mini -- make build  # Codex (OpenAI)
-msgme --ai gemini -- make build              # Gemini
+# Override AI provider for this run
+msgme -a gemma3:1b -- make build             # Ollama (local, fast, tiny)
+msgme -a claude-haiku-4-5 -- make build      # Claude
+msgme -a gpt-5.1-codex-mini -- make build    # Codex (OpenAI)
+msgme -a gemini -- make build                # Gemini
 
 # Add recipients on top of config defaults
-msgme -n +15559999999 -- make build          # add a phone
-msgme --email extra@team.com -- ./deploy.sh  # add an email
-msgme -n +1555 +1666 --email a@b.com -s -- cmd  # add multiple + speech
+msgme -n +15559999999 -- make build          # config phones + this one
+msgme -email extra@team.com -- ./deploy.sh   # config emails + this one (-e works too)
+msgme -n +15551111111 +15552222222 -e a@b.com -s -- make build
 
 # Replace config recipients for this run only
-msgme -nr +15559999999 -- make build         # only this phone
-msgme -er solo@team.com -- ./deploy.sh       # only this email
+msgme -nr +15559999999 -- make build         # only this phone, not config
+msgme -er solo@team.com -- ./deploy.sh       # only this email, not config
 
-# Static message (no AI)
-msgme --msg "Deploy done" -- ./deploy.sh
+# AI instructions (adds to AIP from config)
+msgme -aip "focus on errors and warnings" -- npm test
+msgme -aip "respond in Spanish" -- ./deploy.sh
+msgme -aipr "one word summary only" -- cmd   # replaces config AIP entirely
 
-# Debug mode — see the AI request/response
+# Static message (skip AI entirely)
+msgme -m "Deploy done" -- ./deploy.sh
+
+# Debug mode — see full AI request/response JSON
 msgme -d -- echo "hello world"
-
-# Custom AI instructions
-msgme --aip "focus on any errors or warnings" -- npm test
 ```
 
 ## How It Works

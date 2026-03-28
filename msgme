@@ -17,6 +17,7 @@ AI_MODEL=${AI_MODEL:-""}
 # Store config values for defaults (supports space-separated lists)
 CONF_PHONES=(${=PHONE})
 CONF_EMAILS=(${=EMAIL})
+AI_EXTRA_PROMPT="${AIP:-}"
 
 # Active delivery lists (built by arg parser)
 PHONES=()
@@ -31,29 +32,31 @@ show_help() {
 Usage: msgme [options] -- command [args]
 
 Channels (additive — use multiple to combine):
-  -n  <numbers...>     Add iMessage recipients (space-separated)
-  -nr <numbers...>     Replace config phone list with these
-  --email  <addrs...>  Add email recipients (space-separated)
-  --emailr <addrs...>  Replace config email list with these
-  -er <addrs...>       Same as --emailr
-  -s [text]            Enable speech (optional custom text)
+  -n  <numbers...>    Add iMessage recipients
+  -nr <numbers...>    Replace config phone list
+  -e  <addrs...>      Add email recipients
+  -er <addrs...>      Replace config email list
+  -s  [text]          Enable speech (optional custom text)
+
+AI:
+  -a  <model>         AI provider/model (auto-detected from name)
+  -aip <prompt>       Add to default AI instructions
+  -aipr <prompt>      Replace default AI instructions
 
 Options:
-  --msg <text>       Static text message (skip AI)
-  -v <1-3>           Verbosity (1: Brief, 2: Normal, 3: Chatty)
-  --ai [host:port] <model> AI config (default host: localhost:11434)
-  --aip <prompt>     Additional AI instructions
-  -d                 Debug mode (foreground, shows JSON traffic)
-  -h                 Show this help
+  -m <text>           Static text message (skip AI)
+  -v <1-3>            Verbosity (1: Brief, 2: Normal, 3: Chatty)
+  -d                  Debug mode (foreground, shows JSON traffic)
+  -h                  Show this help
 
+Flags accept any length: -e, -em, -email all work.
 Defaults: Set DEFAULT="IMESSAGE EMAIL SPEECH" in ~/.msgme.conf
-          If no channel flags given, DEFAULT determines what fires.
 
 Examples:
-  msgme -- ./build.sh                          # uses DEFAULT channels
-  msgme -n -- ./build.sh                       # add iMessage (config number)
-  msgme -n +1555 +1666 --email a@b.com -- cmd  # multiple recipients
-  msgme -nr +1999 -- cmd                       # replace config phone list
+  msgme -- ./build.sh                              # DEFAULT channels + config AI
+  msgme -n +15559999999 -email team@co.com -- cmd  # add recipients
+  msgme -nr +15559999999 -er solo@co.com -- cmd    # replace recipients
+  msgme -aip "respond in Spanish" -- ./deploy.sh   # add AI instructions
 EOF
 }
 
@@ -71,40 +74,47 @@ _consume_values() {
 # 3. Robust Argument Parser
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n)
-            HAS_PHONE_FLAG=true; shift
-            # Additive: include config phones
-            [[ "$DEFAULT" == *IMESSAGE* ]] && PHONES+=("${CONF_PHONES[@]}")
-            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
-                PHONES+=("$1"); shift
-            done
-            # -n with no extra values = just config phones
-            ;;
-        -nr)
+        -nr*)
             HAS_PHONE_FLAG=true; PHONES=(); shift
             while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
                 PHONES+=("$1"); shift
             done
             ;;
-        --email|-e)
-            HAS_EMAIL_FLAG=true; shift
-            # Additive: include config emails
-            [[ "$DEFAULT" == *EMAIL* ]] && EMAILS+=("${CONF_EMAILS[@]}")
+        -n*)
+            HAS_PHONE_FLAG=true; shift
+            [[ "$DEFAULT" == *IMESSAGE* ]] && PHONES+=("${CONF_PHONES[@]}")
             while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
-                EMAILS+=("$1"); shift
+                PHONES+=("$1"); shift
             done
             ;;
-        --emailr|-er)
+        -er*|--emailr*)
             HAS_EMAIL_FLAG=true; EMAILS=(); shift
             while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
                 EMAILS+=("$1"); shift
             done
             ;;
-        -s)    HAS_SPEECH_FLAG=true; USE_SPEECH=true; shift
+        -e*|--email*)
+            HAS_EMAIL_FLAG=true; shift
+            [[ "$DEFAULT" == *EMAIL* ]] && EMAILS+=("${CONF_EMAILS[@]}")
+            while [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; do
+                EMAILS+=("$1"); shift
+            done
+            ;;
+        -s*)   HAS_SPEECH_FLAG=true; USE_SPEECH=true; shift
                [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]] && { STATIC_SPEECH="$1"; shift; } ;;
-        --msg) [[ -n "$1" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
-        -v)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
-        --ai)
+        -m*)   [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
+        -v*)   [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
+        -aipr*)
+            shift
+            [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]] && { AI_EXTRA_PROMPT="$1"; shift; } ;;
+        -aip*)
+            shift
+            if [[ $# -gt 0 && "$1" != -* && "$1" != "--" ]]; then
+                [[ -n "$AI_EXTRA_PROMPT" ]] && AI_EXTRA_PROMPT="$AI_EXTRA_PROMPT $1" || AI_EXTRA_PROMPT="$1"
+                shift
+            fi
+            ;;
+        -a*)
             shift
             if [[ "$1" == *" "* ]]; then
                 AI_HOST="${1%% *}"; AI_MODEL="${1#* }"; shift
@@ -116,9 +126,8 @@ while [[ $# -gt 0 ]]; do
                 AI_MODEL="$1"; shift
             fi
             ;;
-        --aip) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { AI_EXTRA_PROMPT="$2"; shift 2; } || shift 1 ;;
-        -d)    DEBUG=1; shift ;;
-        -h)    show_help; exit 0 ;;
+        -d*)   DEBUG=1; shift ;;
+        -h*)   show_help; exit 0 ;;
         --)    shift; break ;;
         *)     shift ;;
     esac
