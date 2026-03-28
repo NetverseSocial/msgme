@@ -242,16 +242,20 @@ print(json.dumps({'sms': str(sms), 'speech': str(speech)}))
         fi
     fi
 
-    # 7. Deliver Email (via Brevo API)
+    # 7. Deliver Email
     if [[ -n "$EMAIL" ]]; then
         [[ -n "$DEBUG" ]] && echo "Sending email to $EMAIL: $final_msg"
-        local email_from="${EMAIL_FROM:-"msgme@Netverse.net"}"
+        local email_from="${EMAIL_FROM:-"msgme@localhost"}"
         local email_from_name="${EMAIL_FROM_NAME:-"msgme"}"
         local email_response
-        email_response=$(curl -4 -s --max-time 15 -X POST 'https://api.brevo.com/v3/smtp/email' \
-            -H "api-key: $BREVO_SMTP_API_KEY" \
-            -H 'Content-Type: application/json' \
-            -d "$(python3 -c '
+
+        if [[ -n "$BREVO_SMTP_API_KEY" ]]; then
+            # Brevo REST API
+            [[ -n "$DEBUG" ]] && echo "--- DEBUG: Email method: Brevo REST API ---"
+            email_response=$(curl -4 -s --max-time 15 -X POST 'https://api.brevo.com/v3/smtp/email' \
+                -H "api-key: $BREVO_SMTP_API_KEY" \
+                -H 'Content-Type: application/json' \
+                -d "$(python3 -c '
 import json, sys
 print(json.dumps({
     "sender": {"name": sys.argv[1], "email": sys.argv[2]},
@@ -259,6 +263,28 @@ print(json.dumps({
     "subject": "msgme notification",
     "textContent": sys.argv[4]
 }))' "$email_from_name" "$email_from" "$EMAIL" "$final_msg")" 2>&1)
+        else
+            # Generic SMTP (works with Gmail, Outlook, Brevo SMTP, any provider)
+            local smtp_host="${SMTP_HOST:-smtp.gmail.com}"
+            local smtp_port="${SMTP_PORT:-587}"
+            local smtp_user="${SMTP_USER:-$BREVO_SMTP_USERNAME}"
+            local smtp_pass="${SMTP_PASS:-$BREVO_SMTP_KEY}"
+            [[ -n "$DEBUG" ]] && echo "--- DEBUG: Email method: SMTP ($smtp_host:$smtp_port) ---"
+            email_response=$(python3 -c "
+import smtplib, sys, os
+from email.mime.text import MIMEText
+msg = MIMEText(sys.argv[4])
+msg['Subject'] = 'msgme notification'
+msg['From'] = sys.argv[2]
+msg['To'] = sys.argv[3]
+smtp = smtplib.SMTP(sys.argv[5], int(sys.argv[6]))
+smtp.starttls()
+smtp.login(sys.argv[7], sys.argv[8])
+smtp.send_message(msg)
+smtp.quit()
+print('Sent!')
+" "$email_from_name" "$email_from" "$EMAIL" "$final_msg" "$smtp_host" "$smtp_port" "$smtp_user" "$smtp_pass" 2>&1)
+        fi
         if [[ -n "$DEBUG" ]]; then
             echo "--- DEBUG: Email result ---\n$email_response"
         fi

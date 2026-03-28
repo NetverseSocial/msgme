@@ -48,6 +48,8 @@ The `--ai` flag auto-detects the provider from the model name:
 
 Cloud providers use their respective CLI tools, which authenticate through your existing subscription account — **no API keys required**. Ollama runs entirely locally.
 
+> **Tip:** For Ollama, a tiny model like `gemma3:1b` (815MB) works great for notification summaries — responds in under a second. No need for large models.
+
 ## Configuration
 
 Create `~/.msgme.conf` with your defaults:
@@ -56,24 +58,31 @@ Create `~/.msgme.conf` with your defaults:
 PHONE="+15551234567"
 EMAIL="user@example.com"
 AI_HOST="localhost:11434"
-AI_MODEL="gemma3:27b"
+AI_MODEL="gemma3:1b"
 VERBOSITY=3
 ```
 
-For email notifications, set your Brevo API key as an environment variable:
-
-```bash
-export BREVO_SMTP_API_KEY="your-api-key-here"
-```
-
-Optionally customize the sender in `~/.msgme.conf`:
-
-```bash
-EMAIL_FROM="notifications@yourdomain.com"
-EMAIL_FROM_NAME="My Build Server"
-```
-
 All settings can be overridden via command-line flags.
+
+### Email Setup
+
+Email works with **any SMTP provider** — Gmail, Outlook, Yahoo, Brevo, etc. Set these environment variables:
+
+```bash
+# Generic SMTP (works with any provider)
+export SMTP_HOST="smtp.gmail.com"    # or smtp.mail.yahoo.com, smtp-relay.brevo.com, etc.
+export SMTP_PORT="587"
+export SMTP_USER="you@gmail.com"
+export SMTP_PASS="your-app-password"
+
+# Customize sender (optional)
+export EMAIL_FROM="notifications@yourdomain.com"
+export EMAIL_FROM_NAME="My Build Server"
+```
+
+> **Gmail users:** Use an [App Password](https://myaccount.google.com/apppasswords), not your regular password.
+
+If you have a [Brevo](https://www.brevo.com) account, you can alternatively set `BREVO_SMTP_API_KEY` to use their REST API (takes priority over SMTP when set).
 
 ### Notification Methods
 
@@ -112,7 +121,7 @@ msgme -- make build
 msgme -s -- ./run_tests.sh
 
 # Use different AI providers
-msgme --ai gemma3:27b -- make build          # Ollama (local)
+msgme --ai gemma3:1b -- make build           # Ollama (local, fast, tiny)
 msgme --ai claude-haiku-4-5 -- make build    # Claude
 msgme --ai gpt-5.1-codex-mini -- make build  # Codex (OpenAI)
 msgme --ai gemini -- make build              # Gemini
