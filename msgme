@@ -1,0 +1,172 @@
+#!/bin/zsh
+
+# 1. Environment & Alias Inheritance
+setopt aliases
+[[ -f ~/.zshrc ]] && source ~/.zshrc
+[[ -f ~/.zprofile ]] && source ~/.zprofile
+
+# 2. Load Defaults from Config
+CONF_FILE="$HOME/.msgme.conf"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+# Set Initial Defaults (if not in config)
+VERBOSITY=${VERBOSITY:-2}
+AI_HOST=${AI_HOST:-"localhost:11434"}
+AI_MODEL=${AI_MODEL:-""}
+USE_SPEECH=false
+
+show_help() {
+    cat << EOF
+Usage: msgme [options] -- command [args]
+
+Options:
+  -n <number>        iMessage phone number (e.g., +17605551234)
+  --msg <text>       Static text message
+  -s [text]          Enable speech (optional custom text)
+  -v <1-3>           Verbosity (1: Brief, 2: Normal, 3: Chatty)
+  --ai [host:port] <model> AI config (default host: localhost:11434)
+  --aip <prompt>     Additional AI instructions
+  -d                 Debug mode (foreground, shows JSON traffic)
+  -h                 Show this help
+
+Example:
+  msgme -n +17605551234 -v 3 --ai "localhost:11434 gemma3:27b" -s -- ./build.sh
+EOF
+}
+
+# 3. Robust Argument Parser
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { PHONE="$2"; shift 2; } || { echo "Error: -n requires a phone number"; exit 1; } ;;
+        --msg) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_MSG="$2"; shift 2; } || shift 1 ;;
+        -s)    USE_SPEECH=true; [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { STATIC_SPEECH="$2"; shift 2; } || shift 1 ;;
+        -v)    [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { VERBOSITY="$2"; shift 2; } || shift 1 ;;
+        --ai)
+            if [[ "$2" == *" "* ]]; then
+                AI_HOST="${2%% *}"; AI_MODEL="${2#* }"; shift 2
+            elif [[ "$2" == *:* || "$2" == "."* ]]; then
+                AI_HOST="$2"; AI_MODEL="$3"; shift 3
+            else
+                AI_MODEL="$2"; shift 2
+            fi
+            [[ "$AI_HOST" == :* ]] && AI_HOST="localhost$AI_HOST" ;;
+        --aip) [[ -n "$2" && "$2" != -* && "$2" != "--" ]] && { AI_EXTRA_PROMPT="$2"; shift 2; } || shift 1 ;;
+        -d)    DEBUG=1; shift ;;
+        -h)    show_help; exit 0 ;;
+        --)    shift; break ;;
+        *)     shift ;; 
+    esac
+done
+
+APP_CMD=("$@")
+[[ ${#APP_CMD} -eq 0 ]] && { show_help; exit 0; }
+
+# 4. Execute the Target App
+LOG_FILE=$(mktemp /tmp/msgme.XXXXXX)
+"${APP_CMD[@]}" 2>&1 | tee "$LOG_FILE"
+EXIT_CODE=${pipestatus[1]}
+
+# 5. The Notification Logic
+notify() {
+    [[ -n $DEBUG ]] && echo "\n--- DEBUG: NOTIFY START ---"
+    local output_content=$(tail -n 100 "$LOG_FILE")
+    local final_msg=$STATIC_MSG
+    local final_speech=$STATIC_SPEECH
+
+    # AI Processing
+    if [[ -n $AI_MODEL ]]; then
+        local sys_text="You are a CLI notification assistant. Analyze the output. Return ONLY a JSON object with 'sms' (string) and 'speech' (string) keys. Verbosity: $VERBOSITY. 'sms' should be a concise summary. 'speech' must be a natural sentence. Context: $AI_EXTRA_PROMPT"
+        local user_text="Exit Code: $EXIT_CODE\nOutput: $output_content"
+
+        local payload=$(python3 -c '
+import json, sys
+data = {"model": sys.argv[3], "messages": [{"role": "system", "content": sys.argv[1]}, {"role": "user", "content": sys.argv[2]}], "stream": False, "format": "json"}
+print(json.dumps(data))' "$sys_text" "$user_text" "$AI_MODEL")
+
+        [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI REQUEST ---" && echo "$payload" | python3 -m json.tool
+
+        local response
+        if [[ -n $DEBUG ]]; then
+            printf "\n⏳ Waiting for AI (%s)..." "$AI_MODEL"
+            local curl_pid_file=$(mktemp /tmp/msgme_curl.XXXXXX)
+            curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload" > "$curl_pid_file" &
+            local curl_pid=$!
+            while kill -0 $curl_pid 2>/dev/null; do
+                printf "."
+                sleep 1
+            done
+            response=$(<"$curl_pid_file")
+            rm -f "$curl_pid_file"
+            echo " done!"
+        else
+            response=$(curl -s --max-time 120 -X POST "http://$AI_HOST/api/chat" -H "Content-Type: application/json" -d "$payload")
+        fi
+        [[ -n $DEBUG ]] && echo "\n--- DEBUG: AI RESPONSE ---" && echo "$response" | python3 -m json.tool
+
+        # Robust Multi-Layer JSON Extraction (Now strips Markdown!)
+        local results=$(echo "$response" | python3 -c "
+import sys, json
+def parse_ai_msg(raw_input):
+    try:
+        data = json.loads(raw_input)
+        content = data.get('message', {}).get('content', '').strip()
+        
+        # Strip markdown formatting if the model added it
+        if content.startswith('\`\`\`'):
+            lines = content.split('\n')
+            if lines[0].startswith('\`\`\`'): lines = lines[1:]
+            if len(lines) > 0 and lines[-1].startswith('\`\`\`'): lines = lines[:-1]
+            content = '\n'.join(lines).strip()
+
+        if isinstance(content, str):
+            try: content = json.loads(content)
+            except: pass
+            
+        sms = content.get('sms', '') if isinstance(content, dict) else ''
+        if isinstance(sms, list):
+            sms = '\n'.join([f\"{i.get('field','')}: {i.get('value','')}\" if isinstance(i,dict) else str(i) for i in sms])
+        speech = content.get('speech', '') if isinstance(content, dict) else ''
+        return {'sms': str(sms), 'speech': str(speech)}
+    except Exception as e:
+        return {'sms': '', 'speech': ''}
+print(json.dumps(parse_ai_msg(sys.stdin.read())))
+")
+        final_msg=$(echo "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('sms', ''))")
+        final_speech=$(echo "$results" | python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('speech', ''))")
+    fi
+
+    # Fallbacks - Only trigger if the variables are completely empty
+    final_msg="${final_msg:-${STATIC_MSG:-"App done (Code $EXIT_CODE)"}}"
+
+    # 6. Deliver iMessage (Argument Method - completely avoids quote crashing)
+    if [[ -n "$PHONE" ]]; then
+        [[ -n "$DEBUG" ]] && echo "Sending iMessage to $PHONE: $final_msg"
+        local imsg_err
+        imsg_err=$(osascript -e 'on run argv' \
+                  -e 'tell application "Messages"' \
+                  -e 'set targetService to 1st account whose service type = iMessage' \
+                  -e 'set targetBuddy to participant (item 2 of argv) of targetService' \
+                  -e 'send (item 1 of argv) to targetBuddy' \
+                  -e 'end tell' \
+                  -e 'end run' -- "$final_msg" "$PHONE" 2>&1)
+        if [[ -n "$DEBUG" && -n "$imsg_err" ]]; then
+            echo "--- DEBUG: iMessage result ---\n$imsg_err"
+        fi
+    fi
+
+    # 7. Deliver Speech
+    if [[ "$USE_SPEECH" == true ]]; then
+        final_speech="${final_speech:-${STATIC_SPEECH:-"Application completed"}}"
+        [[ -n "$DEBUG" ]] && echo "Speaking: $final_speech"
+        say "$final_speech"
+    fi
+
+    rm "$LOG_FILE"
+}
+
+# 8. Backgrounding Control
+if [[ -n $DEBUG ]]; then
+    notify
+else
+    notify &!
+fi
